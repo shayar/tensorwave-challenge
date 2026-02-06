@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useId, type MouseEvent } from "react";
 
 type Overview = {
   Symbol?: string;
@@ -122,59 +122,189 @@ function FancyLoading({ label }: { label: string }) {
 }
 
 function PriceHistoryChart({ rows }: { rows: PriceRow[] }) {
+  const gradId = useId();
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
   if (!rows || rows.length < 2) return null;
+
+  const W = 720;
+  const H = 200;
+  const pad = 14;
+  const innerW = W - pad * 2;
+  const innerH = H - pad * 2;
 
   const closes = rows.map((r) => r.close);
   const min = Math.min(...closes);
   const max = Math.max(...closes);
   const range = max - min || 1;
 
-  const W = 600;
-  const H = 180;
-  const pad = 10;
-  const innerW = W - pad * 2;
-  const innerH = H - pad * 2;
-
-  const points = rows
-    .map((r, i) => {
+  const pts = useMemo(() => {
+    return rows.map((r, i) => {
       const x = pad + (i / (rows.length - 1)) * innerW;
       const y = pad + (1 - (r.close - min) / range) * innerH;
-      return `${x},${y}`;
-    })
-    .join(" ");
+      return { ...r, x, y };
+    });
+  }, [rows, innerW, innerH, min, range]);
+
+  const lineD = useMemo(() => {
+    return pts
+      .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(2)} ${p.y.toFixed(2)}`)
+      .join(" ");
+  }, [pts]);
+
+  const areaD = useMemo(() => {
+    const first = pts[0];
+    const last = pts[pts.length - 1];
+    return `${lineD} L ${last.x.toFixed(2)} ${(H - pad).toFixed(2)} L ${first.x.toFixed(
+      2
+    )} ${(H - pad).toFixed(2)} Z`;
+  }, [lineD, pts, H]);
+
+  const lastPt = pts[pts.length - 1];
+  const hoverPt = hoverIdx !== null ? pts[hoverIdx] : null;
+
+  function clamp(n: number, lo: number, hi: number) {
+    return Math.max(lo, Math.min(hi, n));
+  }
+
+  function onMove(e: MouseEvent<SVGSVGElement>) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const px = ((e.clientX - rect.left) / rect.width) * W;
+
+    const t = (px - pad) / innerW; // 0..1
+    const idx = clamp(Math.round(t * (pts.length - 1)), 0, pts.length - 1);
+
+    setHoverIdx(idx);
+  }
+
+  function onLeave() {
+    setHoverIdx(null);
+  }
+
+  // Tooltip positioning in %
+  const tooltipLeftPct = hoverPt ? clamp((hoverPt.x / W) * 100, 8, 92) : 50;
 
   return (
     <div className="mt-4">
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        className="h-40 w-full text-gray-900"
-        role="img"
-        aria-label="Price history line chart"
-      >
-        {/* subtle baseline */}
-        <line
-          x1={pad}
-          y1={H - pad}
-          x2={W - pad}
-          y2={H - pad}
-          stroke="currentColor"
-          strokeOpacity="0.15"
-        />
+      <div className="relative">
+        {hoverPt && (
+          <div
+            className="pointer-events-none absolute top-2 -translate-x-1/2 rounded-xl border bg-white/95 px-3 py-2 text-xs shadow-sm backdrop-blur"
+            style={{ left: `${tooltipLeftPct}%` }}
+          >
+            <div className="font-medium text-gray-900">{hoverPt.date}</div>
+            <div className="mt-0.5 text-gray-700">
+              Close: <span className="font-medium">{formatMoney(hoverPt.close)}</span>
+            </div>
+          </div>
+        )}
 
-        <polyline
-          points={points}
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </svg>
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          className="h-44 w-full select-none"
+          role="img"
+          aria-label="Price history chart"
+          onMouseMove={onMove}
+          onMouseLeave={onLeave}
+        >
+          <defs>
+            <linearGradient id={`area-${gradId}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="currentColor" stopOpacity="0.18" />
+              <stop offset="70%" stopColor="currentColor" stopOpacity="0.04" />
+              <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+
+          {/* light horizontal grid */}
+          {[0.25, 0.5, 0.75].map((t) => {
+            const y = pad + t * innerH;
+            return (
+              <line
+                key={t}
+                x1={pad}
+                y1={y}
+                x2={W - pad}
+                y2={y}
+                stroke="currentColor"
+                strokeOpacity="0.08"
+              />
+            );
+          })}
+
+          {/* area fill */}
+          <path d={areaD} fill={`url(#area-${gradId})`} />
+
+          {/* line */}
+          <path
+            d={lineD}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+
+          {/* hover crosshair + dot */}
+          {hoverPt && (
+            <>
+              <line
+                x1={hoverPt.x}
+                y1={pad}
+                x2={hoverPt.x}
+                y2={H - pad}
+                stroke="currentColor"
+                strokeOpacity="0.18"
+              />
+              <circle cx={hoverPt.x} cy={hoverPt.y} r="4" fill="currentColor" />
+              <circle cx={hoverPt.x} cy={hoverPt.y} r="7" fill="currentColor" opacity="0.15" />
+            </>
+          )}
+
+          {/* last point marker */}
+          <circle cx={lastPt.x} cy={lastPt.y} r="4.5" fill="currentColor" />
+          <circle cx={lastPt.x} cy={lastPt.y} r="9" fill="currentColor" opacity="0.12" />
+
+          {/* min/max labels */}
+          <text x={pad} y={pad + 10} fontSize="11" fill="currentColor" opacity="0.55">
+            Max {formatMoney(max)}
+          </text>
+          <text x={pad} y={H - pad - 2} fontSize="11" fill="currentColor" opacity="0.55">
+            Min {formatMoney(min)}
+          </text>
+        </svg>
+      </div>
 
       <div className="mt-2 flex justify-between text-xs text-gray-500">
         <span>{rows[0].date}</span>
         <span>{rows[rows.length - 1].date}</span>
       </div>
+    </div>
+  );
+}
+
+function StatTile({
+  label,
+  value,
+  hint,
+  tone = "neutral",
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  tone?: "neutral" | "pos" | "neg";
+}) {
+  const toneClass =
+    tone === "pos"
+      ? "text-emerald-700"
+      : tone === "neg"
+      ? "text-rose-700"
+      : "text-gray-900";
+
+  return (
+    <div className="rounded-xl border border-gray-100 bg-white px-3 py-2">
+      <div className="text-[11px] font-medium text-gray-500">{label}</div>
+      <div className={`mt-1 text-sm font-semibold ${toneClass}`}>{value}</div>
+      {hint ? <div className="mt-1 text-[11px] text-gray-500">{hint}</div> : null}
     </div>
   );
 }
@@ -351,9 +481,9 @@ export default function StockDetailsClient({ symbol }: { symbol: string }) {
   }, [normalizedSymbol, pricesReloadToken]);
 
   return (
-    <section className="grid gap-6 lg:grid-cols-2">
+    <section className="grid gap-6 lg:grid-cols-2 lg:items-stretch">
       {/* Company Overview */}
-      <div className="rounded-2xl border bg-white p-5 shadow-sm">
+      <div className="rounded-2xl border bg-white p-5 shadow-sm flex flex-col min-h-0 lg:h-[78vh]">
         <h2 className="text-lg font-medium">Company Overview</h2>
 
         {loadingOverview ? (
@@ -365,7 +495,7 @@ export default function StockDetailsClient({ symbol }: { symbol: string }) {
             onRetry={() => setOverviewReloadToken((x) => x + 1)}
           />
         ) : (
-          <div className="mt-4 space-y-4">
+          <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-2 space-y-4">
             <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <dt className="text-xs font-medium text-gray-500">Symbol</dt>
@@ -408,7 +538,8 @@ export default function StockDetailsClient({ symbol }: { symbol: string }) {
       </div>
 
       {/* Daily Price History */}
-      <div className="rounded-2xl border bg-white p-5 shadow-sm">
+      <div className="rounded-2xl border bg-white p-5 shadow-sm flex flex-col min-h-0 lg:h-[78vh]">
+
         <h2 className="text-lg font-medium">Daily Price History</h2>
         <p className="mt-2 text-sm text-gray-600">
           Latest daily closes & volume, plus % change vs previous trading day.
@@ -435,29 +566,33 @@ export default function StockDetailsClient({ symbol }: { symbol: string }) {
         ) : !prices || prices.length === 0 ? (
           <p className="mt-3 text-sm text-gray-600">No price data available.</p>
         ) : (
-          <div className="mt-4 overflow-x-auto">
-            <PriceHistoryChart rows={[...prices].reverse()} />
-            <table className="w-full text-left text-sm">
-              <thead className="border-b text-xs text-gray-500">
-                <tr>
-                  <th className="py-2 pr-3">Date</th>
-                  <th className="py-2 pr-3">Close</th>
-                  <th className="py-2 pr-3">Volume</th>
-                  <th className="py-2 pr-3">% Change</th>
-                </tr>
-              </thead>
-              <tbody>
-                {prices.map((row) => (
-                  <tr key={row.date} className="border-b last:border-b-0">
-                    <td className="py-2 pr-3 font-medium">{row.date}</td>
-                    <td className="py-2 pr-3">{formatMoney(row.close)}</td>
-                    <td className="py-2 pr-3">{formatNumber(row.volume)}</td>
-                    <td className="py-2 pr-3">{formatPct(row.pctChange)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <div className="mt-4 flex min-h-0 flex-1 flex-col">
+  <PriceHistoryChart rows={[...prices].reverse()} />
+
+  <div className="mt-4 min-h-0 flex-1 overflow-x-auto overflow-y-auto rounded-xl border border-gray-100">
+    <table className="w-full text-left text-sm">
+      <thead className="sticky top-0 border-b bg-white/95 text-xs text-gray-500 backdrop-blur">
+        <tr>
+          <th className="py-2 pr-3">Date</th>
+          <th className="py-2 pr-3">Close</th>
+          <th className="py-2 pr-3">Volume</th>
+          <th className="py-2 pr-3">% Change</th>
+        </tr>
+      </thead>
+      <tbody>
+        {prices.map((row) => (
+          <tr key={row.date} className="border-b last:border-b-0">
+            <td className="py-2 pr-3 font-medium">{row.date}</td>
+            <td className="py-2 pr-3">{formatMoney(row.close)}</td>
+            <td className="py-2 pr-3">{formatNumber(row.volume)}</td>
+            <td className="py-2 pr-3">{formatPct(row.pctChange)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</div>
+
         )}
       </div>
     </section>
