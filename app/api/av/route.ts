@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import path from "path";
 import { promises as fs } from "fs";
 
-// We read local files (fixtures + disk cache) -> must run on Node.js runtime.
 export const runtime = "nodejs";
 
 type AvFunction = "OVERVIEW" | "TIME_SERIES_DAILY";
@@ -19,11 +18,11 @@ type CacheEntry = {
   source: CacheSource;
 };
 
-// In-memory cache (per dev server / per instance)
+// -------------------- In-memory cache (fallback, per instance) --------------------
 const globalForCache = globalThis as unknown as { __avCache?: Map<string, CacheEntry> };
 const memCache = globalForCache.__avCache ?? (globalForCache.__avCache = new Map());
 
-// Serialize upstream calls + space them out (~1/sec) to reduce burst throttling
+// -------------------- Serialize upstream calls (avoid burst) --------------------
 const limiter = globalThis as unknown as {
   __avQueue?: Promise<void>;
   __avLastCallAt?: number;
@@ -51,7 +50,7 @@ async function scheduleAlphaVantageCall<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 function ttlSeconds(fn: AvFunction) {
-  // Overview changes infrequently; daily series changes more often.
+  // Used only for "freshness" decisions when writing cache and serving mem hits as fallback.
   return fn === "OVERVIEW" ? 24 * 60 * 60 : 60 * 60;
 }
 
@@ -111,14 +110,81 @@ async function readFixture(fn: AvFunction, symbol: string): Promise<unknown | nu
   try {
     const raw = await fs.readFile(p, "utf8");
     const parsed = JSON.parse(raw);
-    // allow either payload-only files OR disk-style wrapper (extra robust)
-    if (parsed && typeof parsed === "object" && "payload" in parsed) {
-      return (parsed as any).payload;
-    }
+    // allow either payload-only OR disk-style wrapper
+    if (parsed && typeof parsed === "object" && "payload" in parsed) return (parsed as any).payload;
     return parsed;
   } catch {
     return null;
   }
+}
+
+// -------------------- Helper: choose best fallback --------------------
+async function fallbackResponse(params: {
+  fn: AvFunction;
+  symbol: string;
+  key: string;
+  ttlMs: number;
+  now: number;
+  warning: string;
+  retryAfter?: string;
+}) {
+  const { fn, symbol, key, ttlMs, now, warning, retryAfter } = params;
+
+  // 1) prefer disk cache (stale allowed)
+  const diskRecord = await readDiskCache(fn, symbol);
+  if (diskRecord?.payload) {
+    memCache.set(key, { expiresAt: now + ttlMs, payload: diskRecord.payload, source: "disk" });
+    return NextResponse.json(
+      {
+        ok: true,
+        cached: true,
+        stale: true,
+        source: "disk-stale",
+        warning,
+        data: diskRecord.payload,
+      },
+      {
+        headers: {
+          "X-Data-Source": "disk-stale",
+          ...(retryAfter ? { "Retry-After": retryAfter } : {}),
+        },
+      }
+    );
+  }
+
+  // 2) then fixture
+  const fixture = await readFixture(fn, symbol);
+  if (fixture) {
+    memCache.set(key, { expiresAt: now + ttlMs, payload: fixture, source: "fixture" });
+    void writeDiskCache(fn, symbol, fixture);
+    return NextResponse.json(
+      {
+        ok: true,
+        cached: true,
+        source: "fixture",
+        warning,
+        data: fixture,
+      },
+      {
+        headers: {
+          "X-Data-Source": "fixture",
+          ...(retryAfter ? { "Retry-After": retryAfter } : {}),
+        },
+      }
+    );
+  }
+
+  // 3) lastly: mem cache (only if present and not wildly old)
+  const memHit = memCache.get(key);
+  if (memHit?.payload) {
+    return NextResponse.json(
+      { ok: true, cached: true, stale: true, source: "memory", warning, data: memHit.payload },
+      { headers: { "X-Data-Source": "memory" } }
+    );
+  }
+
+  // nothing to fall back to
+  return null;
 }
 
 export async function GET(req: NextRequest) {
@@ -143,32 +209,7 @@ export async function GET(req: NextRequest) {
   const now = Date.now();
   const ttlMs = ttlSeconds(fn) * 1000;
 
-  // 1) Memory cache hit
-  const memHit = memCache.get(key);
-  if (memHit && memHit.expiresAt > now) {
-    void writeDiskCache(fn, symbol, memHit.payload);
-    return NextResponse.json(
-      { ok: true, cached: true, source: "memory", data: memHit.payload },
-      { headers: { "Cache-Control": "public, max-age=0, s-maxage=60" } }
-    );
-  }
-
-  // 2) Disk cache hit (fresh or stale candidate)
-  const diskRecord = await readDiskCache(fn, symbol);
-  const diskAgeMs = diskRecord ? now - diskRecord.savedAt : Infinity;
-  const diskFresh = diskRecord ? diskAgeMs <= ttlMs : false;
-
-  if (diskRecord && diskFresh) {
-    memCache.set(key, { expiresAt: now + ttlMs, payload: diskRecord.payload, source: "disk" });
-    return NextResponse.json(
-      { ok: true, cached: true, source: "disk", data: diskRecord.payload },
-      { headers: { "Cache-Control": `public, max-age=0, s-maxage=${ttlSeconds(fn)}` } }
-    );
-  }
-
-  const staleCandidate = diskRecord?.payload ?? null;
-
-  // 3) Upstream call
+  // -------------------- NETWORK-FIRST --------------------
   const url = new URL("https://www.alphavantage.co/query");
   url.searchParams.set("function", fn);
   url.searchParams.set("symbol", symbol);
@@ -186,171 +227,96 @@ export async function GET(req: NextRequest) {
     const text = await res.text();
     const parsed = safeJsonParse(text);
 
+    // 1) non-JSON => fallback
     if (!parsed.ok) {
-      // non-JSON upstream: stale -> fixture -> error
-      if (staleCandidate) {
-        return NextResponse.json(
-          {
-            ok: true,
-            cached: true,
-            stale: true,
-            source: "disk-stale",
-            warning: "Upstream returned non-JSON; served cached data.",
-            data: staleCandidate,
-          },
-          { headers: { "X-Data-Source": "disk-stale" } }
-        );
-      }
-
-      const fixture = await readFixture(fn, symbol);
-      if (fixture) {
-        memCache.set(key, { expiresAt: now + ttlMs, payload: fixture, source: "fixture" });
-        void writeDiskCache(fn, symbol, fixture);
-        return NextResponse.json(
-          {
-            ok: true,
-            cached: true,
-            source: "fixture",
-            warning: "Upstream returned non-JSON; served fixture data.",
-            data: fixture,
-          },
-          { headers: { "X-Data-Source": "fixture" } }
-        );
-      }
-
-      return jsonError("Upstream returned non-JSON response.", 502);
+      const fb = await fallbackResponse({
+        fn,
+        symbol,
+        key,
+        ttlMs,
+        now,
+        warning: "Upstream returned non-JSON; served fallback data.",
+      });
+      if (fb) return fb;
+      return jsonError("Upstream returned non-JSON response and no fallback is available.", 502);
     }
 
     const data: any = parsed.value;
 
-    // Alpha Vantage throttle/quota often comes as Note or Information
+    // 2) throttle/quota => fallback (rate limit friendly behavior)
     const throttleMsg = data?.Note ?? data?.Information;
     if (throttleMsg) {
-      if (staleCandidate) {
-        return NextResponse.json(
-          {
-            ok: true,
-            cached: true,
-            stale: true,
-            source: "disk-stale",
-            warning: String(throttleMsg),
-            data: staleCandidate,
-          },
-          { headers: { "X-Data-Source": "disk-stale", "Retry-After": "1" } }
-        );
-      }
+      const fb = await fallbackResponse({
+        fn,
+        symbol,
+        key,
+        ttlMs,
+        now,
+        warning: String(throttleMsg),
+        retryAfter: "1",
+      });
+      if (fb) return fb;
 
-      const fixture = await readFixture(fn, symbol);
-      if (fixture) {
-        memCache.set(key, { expiresAt: now + ttlMs, payload: fixture, source: "fixture" });
-        void writeDiskCache(fn, symbol, fixture);
-        return NextResponse.json(
-          {
-            ok: true,
-            cached: true,
-            source: "fixture",
-            warning: String(throttleMsg),
-            data: fixture,
-          },
-          { headers: { "X-Data-Source": "fixture", "Retry-After": "1" } }
-        );
-      }
-
-      // No fallback -> 429 (your UI handles this)
       return NextResponse.json(
         { ok: false, error: String(throttleMsg) },
         { status: 429, headers: { "Retry-After": "1" } }
       );
     }
 
+    // 3) AV error => fallback
     if (data?.["Error Message"]) {
-      const msg = `Alpha Vantage error: ${data["Error Message"]}`;
-
-      if (staleCandidate) {
-        return NextResponse.json(
-          { ok: true, cached: true, stale: true, source: "disk-stale", warning: msg, data: staleCandidate },
-          { headers: { "X-Data-Source": "disk-stale" } }
-        );
-      }
-
-      const fixture = await readFixture(fn, symbol);
-      if (fixture) {
-        memCache.set(key, { expiresAt: now + ttlMs, payload: fixture, source: "fixture" });
-        void writeDiskCache(fn, symbol, fixture);
-        return NextResponse.json(
-          { ok: true, cached: true, source: "fixture", warning: msg, data: fixture },
-          { headers: { "X-Data-Source": "fixture" } }
-        );
-      }
-
-      return jsonError(msg, 502);
+      const fb = await fallbackResponse({
+        fn,
+        symbol,
+        key,
+        ttlMs,
+        now,
+        warning: `Alpha Vantage error: ${data["Error Message"]}`,
+      });
+      if (fb) return fb;
+      return jsonError(`Alpha Vantage error: ${data["Error Message"]}`, 502);
     }
 
+    // 4) HTTP not ok => fallback
     if (!res.ok) {
-      const msg = `Upstream HTTP ${res.status}`;
-
-      if (staleCandidate) {
-        return NextResponse.json(
-          { ok: true, cached: true, stale: true, source: "disk-stale", warning: msg, data: staleCandidate },
-          { headers: { "X-Data-Source": "disk-stale" } }
-        );
-      }
-
-      const fixture = await readFixture(fn, symbol);
-      if (fixture) {
-        memCache.set(key, { expiresAt: now + ttlMs, payload: fixture, source: "fixture" });
-        void writeDiskCache(fn, symbol, fixture);
-        return NextResponse.json(
-          { ok: true, cached: true, source: "fixture", warning: msg, data: fixture },
-          { headers: { "X-Data-Source": "fixture" } }
-        );
-      }
-
-      return jsonError(msg, 502);
+      const fb = await fallbackResponse({
+        fn,
+        symbol,
+        key,
+        ttlMs,
+        now,
+        warning: `Upstream HTTP ${res.status}`,
+      });
+      if (fb) return fb;
+      return jsonError(`Upstream HTTP ${res.status}`, 502);
     }
 
-    // Success: cache in memory + disk
+    // ✅ Success: write through cache (for future fallbacks)
     memCache.set(key, { expiresAt: now + ttlMs, payload: data, source: "upstream" });
     await writeDiskCache(fn, symbol, data);
 
     return NextResponse.json(
       { ok: true, cached: false, source: "upstream", data },
-      { headers: { "Cache-Control": `public, max-age=0, s-maxage=${ttlSeconds(fn)}` } }
+      {
+        headers: {
+          "Cache-Control": `public, max-age=0, s-maxage=${ttlSeconds(fn)}`,
+          "X-Data-Source": "upstream",
+        },
+      }
     );
   } catch (err: any) {
-    // Network/timeouts: stale -> fixture -> error
-    if (staleCandidate) {
-      return NextResponse.json(
-        {
-          ok: true,
-          cached: true,
-          stale: true,
-          source: "disk-stale",
-          warning: err?.name === "AbortError" ? "Upstream timed out." : "Upstream fetch failed.",
-          data: staleCandidate,
-        },
-        { headers: { "X-Data-Source": "disk-stale" } }
-      );
-    }
-
-    const fixture = await readFixture(fn, symbol);
-    if (fixture) {
-      memCache.set(key, { expiresAt: now + ttlMs, payload: fixture, source: "fixture" });
-      void writeDiskCache(fn, symbol, fixture);
-      return NextResponse.json(
-        {
-          ok: true,
-          cached: true,
-          source: "fixture",
-          warning: err?.name === "AbortError" ? "Upstream timed out; served fixture data." : "Upstream failed; served fixture data.",
-          data: fixture,
-        },
-        { headers: { "X-Data-Source": "fixture" } }
-      );
-    }
+    const fb = await fallbackResponse({
+      fn,
+      symbol,
+      key,
+      ttlMs,
+      now,
+      warning: err?.name === "AbortError" ? "Upstream timed out." : "Upstream fetch failed.",
+    });
+    if (fb) return fb;
 
     if (err?.name === "AbortError") return jsonError("Upstream request timed out.", 504);
-    return jsonError("Failed to fetch from Alpha Vantage.", 502);
+    return jsonError("Failed to fetch from Alpha Vantage and no fallback is available.", 502);
   } finally {
     clearTimeout(timeout);
   }

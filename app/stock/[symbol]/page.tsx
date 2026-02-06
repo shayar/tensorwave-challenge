@@ -1,7 +1,7 @@
 import Link from "next/link";
-import StockLogo from "@/components/StockLogo";
-import { getStock } from "@/lib/stocks";
 import StockDetailsClient from "./StockDetailsClient";
+import StockLogo from "@/components/StockLogo";
+import { STOCKS } from "@/lib/stocks";
 
 type Props = {
   params: Promise<{ symbol: string }>;
@@ -10,21 +10,19 @@ type Props = {
 export default async function StockDetailsPage({ params }: Props) {
   const { symbol } = await params;
   const normalizedSymbol = decodeURIComponent(symbol).toUpperCase();
-
-  const meta = getStock(normalizedSymbol);
+  const stock = STOCKS.find((s) => s.symbol === normalizedSymbol);
 
   return (
-    <main className="mx-auto max-w-6xl px-4 py-10">
-      <header className="mb-8 flex items-start justify-between gap-4">
-        <div className="flex items-center gap-4">
-          {meta ? <StockLogo name={meta.name} domain={meta.domain} size={52} /> : null}
-
+    <main className="relative mx-auto max-w-6xl px-4 py-10">
+      <header className="mb-8 flex items-center justify-between gap-4">
+        <div className="flex items-start gap-4">
+          <StockLogo symbol={normalizedSymbol} size={52} />
           <div>
             <h1 className="text-3xl font-semibold tracking-tight">
               {normalizedSymbol}
-              {meta?.name ? (
+              {stock?.name ? (
                 <span className="ml-3 text-base font-medium text-gray-600">
-                  {meta.name}
+                  {stock.name}
                 </span>
               ) : null}
             </h1>
@@ -36,7 +34,8 @@ export default async function StockDetailsPage({ params }: Props) {
 
         <Link
           href="/"
-          className="rounded-xl border bg-white px-4 py-2 text-sm shadow-sm transition hover:shadow-md focus:outline-none focus:ring-2 focus:ring-black/20"
+          className="rounded-xl border bg-white px-4 py-2 text-sm shadow-sm transition
+                     hover:shadow-md focus:outline-none focus:ring-2 focus:ring-black/20"
         >
           ← Back
         </Link>
