@@ -1,30 +1,31 @@
-export default function LoadingStockDetails() {
+export default function Loading() {
   return (
-    <section className="grid gap-6 lg:grid-cols-2">
-      <div className="rounded-2xl border bg-white p-6 shadow-sm">
-        <div className="h-6 w-48 animate-pulse rounded bg-gray-200" />
-        <div className="mt-6 grid grid-cols-2 gap-4">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <div key={i} className="space-y-2">
-              <div className="h-3 w-20 animate-pulse rounded bg-gray-200" />
-              <div className="h-4 w-32 animate-pulse rounded bg-gray-200" />
-            </div>
-          ))}
-        </div>
-      </div>
+    <main className="mx-auto max-w-6xl px-4 py-10">
+      <div className="h-8 w-40 rounded skeleton-shimmer" />
+      <div className="mt-3 h-4 w-96 rounded skeleton-shimmer" />
 
-      <div className="rounded-2xl border bg-white p-6 shadow-sm">
-        <div className="h-6 w-52 animate-pulse rounded bg-gray-200" />
-        <div className="mt-4 h-44 w-full animate-pulse rounded bg-gray-200" />
-        <div className="mt-6 grid gap-3 sm:grid-cols-2">
-          {Array.from({ length: 4 }).map((_, i) => (
-            <div key={i} className="rounded-2xl border bg-white p-4 shadow-sm">
-              <div className="h-3 w-24 animate-pulse rounded bg-gray-200" />
-              <div className="mt-3 h-6 w-32 animate-pulse rounded bg-gray-200" />
-            </div>
-          ))}
+      <div className="mt-8 grid gap-6 lg:grid-cols-2">
+        <div className="rounded-2xl border bg-white p-5 shadow-sm">
+          <div className="h-5 w-44 rounded skeleton-shimmer" />
+          <div className="mt-4 space-y-3">
+            <div className="h-4 w-2/3 rounded skeleton-shimmer" />
+            <div className="h-4 w-1/2 rounded skeleton-shimmer" />
+            <div className="h-64 w-full rounded skeleton-shimmer" />
+          </div>
+        </div>
+
+        <div className="rounded-2xl border bg-white p-5 shadow-sm">
+          <div className="h-5 w-52 rounded skeleton-shimmer" />
+          <div className="mt-4 h-56 w-full rounded skeleton-shimmer" />
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            <div className="h-24 rounded skeleton-shimmer" />
+            <div className="h-24 rounded skeleton-shimmer" />
+            <div className="h-24 rounded skeleton-shimmer" />
+            <div className="h-24 rounded skeleton-shimmer" />
+          </div>
+          <div className="mt-4 h-48 w-full rounded skeleton-shimmer" />
         </div>
       </div>
-    </section>
+    </main>
   );
 }
